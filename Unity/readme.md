@@ -1,1 +1,0 @@
-The PRC.Protos.dll simply contains the prc.proto file built for C# using the default settings.
