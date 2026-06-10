@@ -6,9 +6,11 @@ import json
 import math
 import os
 import queue
+import ssl
 import subprocess
 import sys
 import threading
+import traceback
 from typing import Optional
 
 import bpy
@@ -350,6 +352,28 @@ def _load_pem_file(path: str) -> Optional[bytes]:
         return None
 
 
+def _load_ca_certificate_file(path: str) -> Optional[bytes]:
+    """Read a CA certificate file and return PEM bytes for gRPC.
+
+    Accepts either PEM or DER input so bundled platform assets can be used
+    directly as custom trust roots.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:  # noqa: BLE001
+        return None
+
+    if b"BEGIN CERTIFICATE" in raw:
+        return raw
+
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    return pem.encode("ascii")
+
+
 def _load_prc_ca_from_login_keychain() -> Optional[bytes]:
     """On macOS, read the PRC issuer CA directly from the user's login keychain."""
     if sys.platform != "darwin":
@@ -379,6 +403,47 @@ def _load_prc_ca_from_login_keychain() -> Optional[bytes]:
     if b"BEGIN CERTIFICATE" not in out:
         return None
     return out
+
+
+def _try_install_prc_ca_to_login_keychain() -> tuple[bool, str]:
+    """Best-effort install of the bundled PRC root CA into login keychain."""
+    if sys.platform != "darwin":
+        return False, "unsupported platform"
+
+    cert_path = os.path.join(
+        _addon_dir(), "PRC.Server", "Certificates", "PRCRootCertificate.crt"
+    )
+    if not os.path.isfile(cert_path):
+        return False, "bundled root certificate not found"
+
+    keychain_path = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    cmd = [
+        "security",
+        "add-trusted-cert",
+        "-r",
+        "trustRoot",
+        "-k",
+        keychain_path,
+        cert_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, repr(exc)
+
+    if proc.returncode == 0:
+        return True, "installed"
+
+    err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")
+    err = " ".join(err.split())
+    if len(err) > 160:
+        err = err[:157] + "..."
+    return False, err or f"security exited with code {proc.returncode}"
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +482,28 @@ def _setup_pipeline(props: dict) -> None:
         trust_candidates: list[tuple[str, Optional[bytes]]] = []
 
         keychain_ca = _load_prc_ca_from_login_keychain()
+        if keychain_ca is None and sys.platform == "darwin":
+            ok, note = _try_install_prc_ca_to_login_keychain()
+            if ok:
+                post_status("Installed PRC root CA into login keychain.")
+                keychain_ca = _load_prc_ca_from_login_keychain()
+            else:
+                post_status(
+                    "PRC root CA not in login keychain; "
+                    f"auto-install failed ({note})."
+                )
         if keychain_ca is not None:
             trust_candidates.append(("login keychain PRC CA", keychain_ca))
 
+        bundled_ca_path = os.path.join(
+            _addon_dir(), "PRC.Server", "Certificates", "PRCRootCertificate.crt"
+        )
+        bundled_ca = _load_ca_certificate_file(bundled_ca_path)
+        if bundled_ca is not None:
+            trust_candidates.append(("bundled root CA", bundled_ca))
+
+        # Backward-compatible fallback for older bundles that only shipped
+        # the leaf/server PEM next to the add-on sources.
         bundled_path = os.path.join(_addon_dir(), "PRCServerCertificate.pem")
         bundled_cert = _load_pem_file(bundled_path)
         if bundled_cert is not None:
@@ -572,6 +656,7 @@ def _setup_pipeline(props: dict) -> None:
         _set_setup_done(True)
 
     except grpc.RpcError as e:
+        traceback.print_exc()
         code_name = ""
         try:
             code_name = getattr(e.code(), "name", str(e.code()))
@@ -597,6 +682,7 @@ def _setup_pipeline(props: dict) -> None:
         post_status(f"Setup failed (RPC): {_format_rpc_error(e)}.{hint}")
         _disconnect_internal()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
         post_status(f"Setup failed: {e!r}")
         _disconnect_internal()
 

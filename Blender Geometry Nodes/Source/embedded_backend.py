@@ -20,6 +20,8 @@ SERVER_PORT = 5001
 
 _process: Optional[subprocess.Popen] = None
 _process_lock = threading.Lock()
+_process_log_handle = None
+_log_path: Optional[str] = None
 
 
 def _addon_dir() -> str:
@@ -28,6 +30,20 @@ def _addon_dir() -> str:
 
 def _server_dir() -> str:
     return os.path.join(_addon_dir(), "PRC.Server")
+
+
+def log_path() -> Optional[str]:
+    return _log_path
+
+
+def _startup_log_hint() -> str:
+    if _log_path:
+        return f" See server log: {_log_path}"
+    return ""
+
+
+def _server_log_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "prc_blender_server.log")
 
 
 def _is_port_open(host: str, port: int, timeout_s: float = 0.3) -> bool:
@@ -284,7 +300,7 @@ def ensure_started(startup_timeout_s: float = 12.0) -> tuple[bool, str]:
 
     Returns (ok, message).
     """
-    global _process
+    global _process, _process_log_handle, _log_path
 
     # If endpoint is already live (our process or user-started process), reuse it.
     if endpoint_reachable():
@@ -324,15 +340,23 @@ def ensure_started(startup_timeout_s: float = 12.0) -> tuple[bool, str]:
         kwargs = {
             "cwd": server_dir,
             "env": env,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         try:
+            _log_path = _server_log_path()
+            _process_log_handle = open(_log_path, "ab")
+            kwargs["stdout"] = _process_log_handle
+            kwargs["stderr"] = subprocess.STDOUT
             _process = subprocess.Popen(argv, **kwargs)
         except Exception as exc:  # noqa: BLE001
+            if _process_log_handle is not None:
+                try:
+                    _process_log_handle.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _process_log_handle = None
             _process = None
             return False, f"Failed to start embedded server ({launcher}): {exc!r}"
 
@@ -343,17 +367,32 @@ def ensure_started(startup_timeout_s: float = 12.0) -> tuple[bool, str]:
             if proc is not None and proc.poll() is not None:
                 code = proc.returncode
                 _process = None
-                return False, f"Embedded server exited during startup (code {code})."
+                if _process_log_handle is not None:
+                    try:
+                        _process_log_handle.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _process_log_handle = None
+                return False, (
+                    f"Embedded server exited during startup (code {code})."
+                    f"{_startup_log_hint()}"
+                )
         if _is_port_open(SERVER_HOST, SERVER_PORT):
-            return True, f"Embedded PRC server started via {launcher}.{install_note}"
+            return True, (
+                f"Embedded PRC server started via {launcher}.{install_note}"
+                f"{_startup_log_hint()}"
+            )
         time.sleep(0.1)
 
-    return False, "Embedded server did not open port 5001 before timeout."
+    return False, (
+        "Embedded server did not open port 5001 before timeout."
+        f"{_startup_log_hint()}"
+    )
 
 
 def stop() -> None:
     """Terminate the managed embedded server process, if any."""
-    global _process
+    global _process, _process_log_handle
     with _process_lock:
         proc = _process
         _process = None
@@ -369,4 +408,11 @@ def stop() -> None:
             proc.kill()
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        if _process_log_handle is not None:
+            try:
+                _process_log_handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _process_log_handle = None
 
