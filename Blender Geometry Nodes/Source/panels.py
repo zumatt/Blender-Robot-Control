@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bpy
 
+from . import embedded_backend as _backend
 from . import grpc_client as _client
 from . import properties as _props
 
@@ -30,11 +31,19 @@ class PRC_PT_main_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Robot Setup", icon="SETTINGS")
 
+        server_running = _backend.is_running()
+        box.operator(
+            "prc.toggle_embedded_server",
+            text="Stop Embedded Server" if server_running else "Start Embedded Server",
+            icon="PAUSE" if server_running else "PLAY",
+        )
+
         # Lock identity / driver / robot once connected — changing any of
         # these mid-session would invalidate the server's robot setup.
         setup_col = box.column()
         setup_col.enabled = not _client.is_setup_done()
         setup_col.prop(props, "client_id")
+        setup_col.prop(props, "custom_header_text", text="Custom Header")
         setup_col.prop(props, "robot_driver", text="Driver")
         setup_col.prop(props, "robot_type", text="Robot")
 
@@ -44,8 +53,13 @@ class PRC_PT_main_panel(bpy.types.Panel):
         else:
             row.operator("prc.disconnect", icon="X")
 
+        box.operator("prc.open_settings", text="Open Server", icon="URL")
+
         box.operator("prc.generate_node_groups", icon="NODETREE")
-        box.operator("prc.open_settings", icon="URL")
+
+        row = box.row()
+        row.enabled = _client.is_setup_done()
+        row.operator("prc.import_src", text="Import .src Program", icon="FILE")
 
         # ---------------- Section 1b: Tool TCP ----------------
         tool_box = layout.box()
@@ -118,10 +132,17 @@ class PRC_PT_main_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Task & Simulation", icon="TIME")
 
-
         sub = box.column()
         sub.enabled = _client.is_setup_done() and props.task_loaded
         sub.prop(props, "simulation_slider", text="Simulation")
+
+        play_row = box.row()
+        play_row.enabled = _client.is_setup_done() and props.task_loaded
+        play_row.operator(
+            "prc.toggle_simulation_play",
+            text="Stop" if props.simulation_playing else "Play",
+            icon="PAUSE" if props.simulation_playing else "PLAY",
+        )
 
         auto_row = box.row()
         auto_row.enabled = _client.is_setup_done()
@@ -131,12 +152,18 @@ class PRC_PT_main_panel(bpy.types.Panel):
         row.enabled = _client.is_setup_done()
         row.operator("prc.load_task", icon="IMPORT")
 
+        row = box.row()
+        row.enabled = _client.is_setup_done() and props.task_loaded and _client.has_program_code()
+        row.operator("prc.export_program", icon="FILE_TICK")
+
         # ---------------- Status ----------------
         box = layout.box()
         box.label(text="Status", icon="INFO")
         col = box.column()
         col.scale_y = 0.8
-        col.label(text=props.status_message or "Idle.")
+        col.prop(props, "status_message", text="")
+        row = box.row(align=True)
+        row.operator("prc.copy_status", icon="COPYDOWN")
 
 
 class PRC_PT_animation_source(bpy.types.Panel):

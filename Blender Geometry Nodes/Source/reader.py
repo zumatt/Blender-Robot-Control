@@ -18,6 +18,7 @@ class _Point:
         "motion", "speed", "axes", "position", "orient",
         "posture", "tool_id", "group_type",
         "motion_group", "inline_code", "is_comment",
+        "action_kind",
     )
 
     def __init__(self):
@@ -37,6 +38,7 @@ class _Point:
         self.motion_group: int = 0
         self.inline_code: str = ""
         self.is_comment: bool = False
+        self.action_kind: int = 0
 
 
 def _read_attr(geo, name, default):
@@ -95,6 +97,18 @@ def _attr_bool(attr, i, default=False) -> bool:
         return default
 
 
+def _function_subprogram_attr(geo):
+    """Return the attribute used to tag function-definition subprogram IDs.
+
+    New node groups write ``prc_function_subprogram_id``; older/legacy trees
+    may still use ``prc_function_id``.
+    """
+    return (
+        _read_attr(geo, "prc_function_subprogram_id", None)
+        or _read_attr(geo, "prc_function_id", None)
+    )
+
+
 def _read_point(geo, i: int) -> _Point:
     p = _Point()
 
@@ -107,9 +121,73 @@ def _read_point(geo, i: int) -> _Point:
             _attr_float(_read_attr(geo, f"prc_a{k}", 0.0), i, 0.0)
             for k in range(1, 7)
         ]
-    elif p.motion == 3:  # Action / Insert Code
+    elif p.motion == 3:  # Action / Insert Code; kind 0 stays generic.
+        p.action_kind = _attr_int(_read_attr(geo, "prc_action_kind", 0), i, 0)
         p.inline_code = _attr_string(_read_attr(geo, "prc_inline_code", ""), i, "")
         p.is_comment  = _attr_bool(_read_attr(geo, "prc_is_comment", False), i, False)
+
+        # Backward-compatibility for stale node groups: infer interrupt
+        # actions from their attributes if action_kind was not stamped.
+        if p.action_kind == 0:
+            if _read_attr(geo, "prc_interrupt_number", None) is not None:
+                p.action_kind = 5
+            elif _read_attr(geo, "prc_interrupt_prio", None) is not None:
+                p.action_kind = 4
+
+        if p.action_kind == 1:
+            port = _attr_int(_read_attr(geo, "prc_io_port", 1), i, 1)
+            state = _attr_bool(_read_attr(geo, "prc_io_state", True), i, True)
+            p.inline_code = f"$OUT[{port}] = {'TRUE' if state else 'FALSE'}"
+            p.is_comment = False
+        elif p.action_kind == 2:
+            sec = _attr_float(_read_attr(geo, "prc_wait_sec", 0.0), i, 0.0)
+            p.inline_code = f"WAIT SEC {sec:g}"
+            p.is_comment = False
+        elif p.action_kind == 3:
+            port = _attr_int(_read_attr(geo, "prc_in_port", 1), i, 1)
+            p.inline_code = f"WAIT FOR $IN[{port}]"
+            p.is_comment = False
+        elif p.action_kind == 4:
+            # Interrupt declaration: [GLOBAL] INTERRUPT DECL Prio WHEN $IN[Port]==Cond DO Subprog
+            is_global = _attr_bool(_read_attr(geo, "prc_interrupt_global", False), i, False)
+            prio = _attr_int(_read_attr(geo, "prc_interrupt_prio", 23), i, 23)
+            port = _attr_int(_read_attr(geo, "prc_interrupt_port", 1), i, 1)
+            condition = _attr_bool(_read_attr(geo, "prc_interrupt_condition", True), i, True)
+            subprog_id = _attr_int(_read_attr(geo, "prc_interrupt_subprogram_id", 1), i, 1)
+            subprog_raw = _attr_string(_read_attr(geo, "prc_interrupt_subprogram", ""), i, "")
+
+            # KUKA user priorities: 1, 2, 4..39, 81..128 (3 and 40..80 reserved).
+            if prio <= 2:
+                prio = max(1, prio)
+            elif prio <= 39:
+                prio = max(4, prio)
+            elif prio <= 80:
+                prio = 81
+            else:
+                prio = min(128, prio)
+
+            port = max(1, port)
+            subprog_id = max(1, subprog_id)
+            subprog = subprog_raw.strip() or f"UP{subprog_id}"
+            cond_str = "TRUE" if condition else "FALSE"
+            prefix = "GLOBAL " if is_global else ""
+            # Emit explicit subprogram call syntax expected by KRL.
+            p.inline_code = f"{prefix}INTERRUPT DECL {prio} WHEN $IN[{port}]=={cond_str} DO {subprog} ()"
+            p.is_comment = False
+        elif p.action_kind == 5:
+            number = _attr_int(_read_attr(geo, "prc_interrupt_number", 1), i, 1)
+            enable = _attr_bool(_read_attr(geo, "prc_interrupt_enable", True), i, True)
+            cmd = "ON" if enable else "OFF"
+            number = int(number)
+            if number > 0:
+                p.inline_code = f"INTERRUPT {cmd} {number}"
+            else:
+                p.inline_code = f"INTERRUPT {cmd}"
+            p.is_comment = False
+        elif p.action_kind == 6:
+            stop1 = _attr_bool(_read_attr(geo, "prc_brake_stop1", False), i, False)
+            p.inline_code = "BRAKE F" if stop1 else "BRAKE"
+            p.is_comment = False
     else:
         v = geo.vertices[i].co
         p.position = mathutils.Vector((v.x, v.y, v.z))
@@ -233,38 +311,32 @@ def build_task_from_carrier(scene) -> "prc_pb2.Task":
             "PRC_Program has no points. Wire motion commands into PRC Task."
         )
 
-    # Bucket points by prc_motion_group ID, preserving order of first
-    # appearance for the groups and input order for points within each
-    # group. Each Motion Group / Action Group / Curve Helper wrapper
-    # stamps a unique-ish ID, so plain Join Geometry between wrappers is
-    # enough — the reader does not need a special join node.
-    #
-    # Bucketing (rather than cutting on adjacent transitions) is robust
-    # against prc_sort_key collisions at group boundaries: e.g. the
-    # alignment retract of one motion group and the approach of the next
-    # share the same orig_idx ± 0.5 fractional offset, and GN's sort can
-    # put them in either order. Contiguous-transition logic would
-    # misattribute points in that case; bucketing always lands each point
-    # in its own group regardless of which side of the tie wins.
-    groups_by_id: dict[int, list[_Point]] = {}
-    group_order: list[int] = []
-    group_meta: dict[int, tuple[int, str]] = {}
-
+    # Preserve the evaluated point order exactly: split into contiguous runs
+    # whenever (group_type, tool_id, motion_group) changes. This makes the
+    # generated program follow the order produced by the final Join Geometry
+    # output, which is the most intuitive behaviour for authored node trees.
+    groups: list[tuple[int, str, list[_Point]]] = []
+    subprog_id_attr = _function_subprogram_attr(geo)
     for i in range(n):
+        # Skip points tagged by a PRC Function Definition node — they belong
+        # to a subprogram body (DEF UPx) and are injected at export time.
+        if _attr_int(subprog_id_attr, i, 0) > 0:
+            continue
         p = _read_point(geo, i)
-        mg = p.motion_group
-        bucket = groups_by_id.get(mg)
-        if bucket is None:
-            bucket = []
-            groups_by_id[mg] = bucket
-            group_order.append(mg)
-            group_meta[mg] = (p.group_type, p.tool_id)
-        bucket.append(p)
+        if not groups:
+            groups.append((p.group_type, p.tool_id, [p]))
+            continue
 
-    groups: list[tuple[int, str, list[_Point]]] = [
-        (group_meta[mg][0], group_meta[mg][1], groups_by_id[mg])
-        for mg in group_order
-    ]
+        last_group_type, last_tool_id, last_points = groups[-1]
+        last_mg = last_points[-1].motion_group
+        if (
+            p.group_type == last_group_type
+            and p.tool_id == last_tool_id
+            and p.motion_group == last_mg
+        ):
+            last_points.append(p)
+        else:
+            groups.append((p.group_type, p.tool_id, [p]))
 
     # Task name and type are fixed for the v1 add-on. The corresponding
     # scene properties still exist for backward compatibility with older
@@ -278,7 +350,7 @@ def build_task_from_carrier(scene) -> "prc_pb2.Task":
         _validate_group_motions(group_type, points)
 
         if group_type == 2:
-            # Action group — emit one TaskPayload per insert-code waypoint.
+            # Action group — emit one TaskPayload per action waypoint.
             for p in points:
                 action = prc_pb2.Action(
                     insert_code_action=prc_pb2.InsertCode(
@@ -310,3 +382,49 @@ def build_task_from_carrier(scene) -> "prc_pb2.Task":
         task.payload.append(prc_pb2.TaskPayload(motion_group_task=mg))
 
     return task
+
+
+def collect_function_definitions_from_carrier(scene) -> "dict[int, list[str]]":
+    """Return a mapping of subprogram ID → ordered list of KRL code lines.
+
+    Points tagged with ``prc_function_subprogram_id > 0`` (or legacy
+    ``prc_function_id > 0``) by a
+    *PRC Function Definition* node group are collected here, grouped by ID
+    in their evaluated order, and returned so the export operator can inject:
+
+        DEF UP{ID} ()
+        <lines>
+        END
+
+    after the main program's closing END.
+    """
+    carrier = bpy.data.objects.get(_ng.CARRIER_OBJECT_NAME)
+    if carrier is None:
+        return {}
+
+    deps = bpy.context.evaluated_depsgraph_get()
+    geo = carrier.evaluated_get(deps).data
+    n = len(geo.vertices)
+    if n == 0:
+        return {}
+
+    subprog_id_attr = _function_subprogram_attr(geo)
+    if subprog_id_attr is None:
+        return {}
+
+    result: dict[int, list[str]] = {}
+    for i in range(n):
+        sid = _attr_int(subprog_id_attr, i, 0)
+        if sid <= 0:
+            continue
+        p = _read_point(geo, i)
+        if p.motion != 3:
+            continue  # Only action-type points are collected as KRL lines
+        line = p.inline_code
+        if not line:
+            continue
+        if sid not in result:
+            result[sid] = []
+        result[sid].append(line)
+
+    return result

@@ -52,6 +52,11 @@ def unregister():
         grpc_client.disconnect()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from . import embedded_backend
+        embedded_backend.stop()
+    except Exception:  # noqa: BLE001
+        pass
 
     for m in reversed(_modules):
         try:

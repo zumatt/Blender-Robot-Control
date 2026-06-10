@@ -1,0 +1,347 @@
+schema_version: 2
+profile: blender-prc-agent
+source_of_truth: agent/LLM_Checklist.yaml
+
+scope:
+  target: prc_blender
+  authoring_model: geometry_nodes_on_prc_program
+  runtime_bridge: grpc_client_in_addon
+  endpoint: https://127.0.0.1:5001
+  conflict_resolution: prefer_blender_gn_implementation_over_generic_prc_protocol
+
+authoritative_paths:
+  code:
+    - prc_blender/panels.py
+    - prc_blender/operators.py
+    - prc_blender/node_groups.py
+    - prc_blender/reader.py
+    - prc_blender/grpc_client.py
+    - prc_blender/embedded_backend.py
+    - prc_blender/src_importer.py
+    - prc_blender/properties.py
+  docs:
+    - readme.md
+    - prc_blender/USER_GUIDE.md
+  rule_on_conflict: code_wins
+
+runtime_architecture:
+  execution_model:
+    - configure_robot_setup_in_panel
+    - ensure_backend_available_embedded_or_existing
+    - write_prc_attributes_on_prc_program_mesh_via_gn
+    - convert_evaluated_mesh_to_task_payload_in_reader
+    - send_task_to_server_via_grpc_client
+    - query_simulation_via_slider_or_play_loop
+  invariants:
+    - carrier_object_name_is_prc_program
+    - toolpath_and_status_come_from_latest_add_robot_task_result
+    - setup_state_gates_operator_availability
+
+state_machine:
+  states:
+    S0_disconnected:
+      setup_done: false
+      task_loaded: false
+    S1_setup_complete:
+      setup_done: true
+      task_loaded: optional
+      ui_identity_fields_locked: true
+    S2_task_loaded:
+      setup_done: true
+      task_loaded: true
+      simulation_slider_valid: true
+      export_may_be_enabled: true
+    S3_playback_active:
+      setup_done: true
+      task_loaded: true
+      simulation_playing: true
+  transitions:
+    - from: S0_disconnected
+      to: S1_setup_complete
+      trigger: prc.setup_robot_success
+    - from: S1_setup_complete
+      to: S2_task_loaded
+      trigger: prc.load_task_success_or_prc.import_src_success_and_task_send_success
+    - from: S2_task_loaded
+      to: S3_playback_active
+      trigger: prc.toggle_simulation_play_start
+    - from: S3_playback_active
+      to: S2_task_loaded
+      trigger: prc.toggle_simulation_play_stop_or_disconnect_or_load_task_restart
+    - from: any
+      to: S0_disconnected
+      trigger: prc.disconnect
+  guardrails:
+    - stop_active_playback_before_simulation_mutating_operations
+    - treat_setup_identity_driver_robot_tool_as_immutable_while_connected
+
+server_connectivity:
+  embedded_backend:
+    - panel_supports_start_stop
+    - setup_may_auto_start_when_endpoint_unreachable
+    - do_not_force_embedded_ownership_if_endpoint_already_live
+  tls_trust_priority:
+    - macos_login_keychain_prc_ca
+    - bundled_cert_file
+    - system_trust
+  diagnostics:
+    - explicit_unavailable_and_certificate_failure_signals
+  constraints:
+    - do_not_document_insecure_channel_defaults_unless_implemented
+
+feature_surface:
+  panel_controls:
+    - setup_robot
+    - disconnect
+    - toggle_embedded_server
+    - open_server
+    - generate_geometry_node_groups
+    - import_src_program
+    - load_task
+    - export_program
+    - simulation_slider
+    - toggle_simulation_play
+    - auto_simulate_on_edit
+    - status_field
+    - copy_status
+  setup_fields:
+    - client_id
+    - custom_header_text
+    - robot_driver
+    - robot_type
+    - tool_fields
+
+geometry_nodes_contract:
+  pipeline_shape: "[motion commands/helpers] -> Join Geometry -> [optional modifiers] -> PRC Task -> Output"
+  motion_group_rules:
+    ptp_motion_group_allows:
+      - AXIS
+      - PTP
+    cartesian_motion_group_allows:
+      - LIN
+    mixed_type_inside_one_group: invalid
+  grouping_rule_in_reader:
+    mode: contiguous_transition
+    keys:
+      - prc_group_type
+      - prc_tool_id
+      - prc_motion_group
+    implication: final_join_geometry_order_is_semantic
+
+action_nodes:
+  availability:
+    - PRC Set Output
+    - PRC Wait
+    - PRC Wait For Input
+    - PRC Brake
+    - PRC Interrupt Declaration
+    - PRC Interrupt Control
+    - PRC Function Definition
+    - PRC Insert Code
+  insert_code_constraint: requires_blender_5_2_plus_string_attributes
+  action_kind_mapping:
+    "0": insert_code_generic_inline
+    "1": set_output_to_out_port_true_false
+    "2": wait_sec
+    "3": wait_for_in_port
+    "4": interrupt_declaration
+    "5": interrupt_control
+    "6": brake_or_brake_f
+  backward_compat:
+    - infer_interrupt_action_kind_when_missing_but_interrupt_attributes_present
+
+function_definition:
+  tag_attributes:
+    preferred: prc_function_subprogram_id
+    legacy: prc_function_id
+  semantics:
+    - tagged_points_excluded_from_main_task_payload
+    - collected_at_export_as_def_up_id_blocks
+
+attribute_contract:
+  required_baseline:
+    - prc_motion
+    - prc_speed
+    - prc_group_type
+    - prc_motion_group
+    - prc_tool_id
+  motion_specific:
+    axis:
+      - prc_a1
+      - prc_a2
+      - prc_a3
+      - prc_a4
+      - prc_a5
+      - prc_a6
+    cartesian:
+      - prc_orient
+      - prc_position_or_vertex_coordinates
+    posture:
+      - prc_posture
+  actions:
+    generic:
+      - prc_inline_code
+      - prc_is_comment
+      - prc_action_kind
+    set_output:
+      - prc_io_port
+      - prc_io_state
+    wait:
+      - prc_wait_sec
+    wait_for_input:
+      - prc_in_port
+    interrupt_decl:
+      - prc_interrupt_prio
+      - prc_interrupt_global
+      - prc_interrupt_port
+      - prc_interrupt_condition
+      - prc_interrupt_subprogram_id
+      - prc_interrupt_subprogram_optional
+    interrupt_control:
+      - prc_interrupt_number
+      - prc_interrupt_enable
+    brake:
+      - prc_brake_stop1
+  validation_pairs:
+    group_type_0: [motion_2]
+    group_type_1: [motion_0, motion_1]
+    group_type_2: [motion_3]
+
+program_io:
+  export_program:
+    enable_when:
+      - setup_done
+      - task_loaded
+      - generated_code_exists
+    extension_by_driver_prefix:
+      KUKA: .src
+      ABB: .mod
+      UR: .script
+      default: .txt
+    append_function_definition_blocks: true
+    custom_header_top_only: true
+  import_src:
+    parse:
+      - KUKA_PTP_blocks
+      - KUKA_LIN_blocks
+      - axis_ptp_A1_to_A6
+      - cartesian_XYZABC
+    side_effects:
+      - replace_carrier_mesh_data
+      - remove_carrier_gn_modifiers
+      - auto_build_and_auto_send_task
+      - refresh_simulation_at_current_slider
+    precondition:
+      - prc_program_exists
+
+simulation:
+  modes:
+    - manual_slider
+    - timer_play_loop
+  play_loop:
+    tick_rate_hz_nominal: 30
+    normalized_wraparound: true
+    prerequisites:
+      - setup_done
+      - task_loaded
+    delta_source:
+      primary: last_task_duration
+      fallback: fixed_increment
+  status_ux:
+    - writable_status_message
+    - copy_to_clipboard
+
+compatibility:
+  blender_minimum: 5.0
+  insert_code_minimum: 5.2
+  note: do_not_claim_insert_code_on_5_0_or_5_1_without_code_change
+
+change_impact_map:
+  ui_layout_or_labels: prc_blender/panels.py
+  button_workflows_timers_import_export: prc_blender/operators.py
+  node_definitions_menu_attribute_stamping: prc_blender/node_groups.py
+  gn_attribute_decode_and_task_assembly: prc_blender/reader.py
+  tls_handshake_settings_program_cache: prc_blender/grpc_client.py
+  embedded_server_lifecycle: prc_blender/embedded_backend.py
+  src_parsing_and_carrier_replacement: prc_blender/src_importer.py
+  scene_property_schema: prc_blender/properties.py
+
+workflow_checklist:
+  before_editing:
+    - classify_change_bucket:
+        allowed_values:
+          - ui_panel
+          - operator_workflow
+          - node_stamping
+          - reader_conversion
+          - grpc_transport
+          - embedded_backend
+          - src_import_export
+    - open_primary_file_for_bucket
+    - confirm_state_constraints:
+        - setup_done
+        - task_loaded
+        - simulation_playing
+  during_editing:
+    - preserve_prc_attribute_abi_unless_intentional
+    - if_action_behavior_changes_update:
+        - prc_blender/node_groups.py
+        - prc_blender/reader.py
+    - if_setup_or_connection_changes_update_at_least_one:
+        - prc_blender/operators.py
+        - prc_blender/grpc_client.py
+        - prc_blender/embedded_backend.py
+    - keep_docs_synchronized_in_same_changeset:
+        - agent/LLM_Checklist.yaml
+        - readme.md
+  after_editing:
+    - symbols_sanity:
+        - panel_operator_bindings_exist
+        - node_group_constants_match_add_menu
+    - workflow_sanity:
+        - setup_load_simulate_export_path_valid
+        - import_src_ends_with_task_load_and_sim_update
+    - action_sanity:
+        - set_output
+        - wait
+        - wait_for_input
+        - brake
+        - interrupt_declaration
+        - interrupt_control
+        - function_definition
+        - insert_code
+    - regression_hotspots:
+        - reader_contiguous_grouping_behavior
+        - function_definition_exclusion_from_main_payload
+        - custom_header_top_only_behavior
+
+high_risk_changes:
+  - rename_bl_idname
+  - rename_ng_constants
+  - rename_prc_attributes
+  - change_task_payload_ordering
+  - change_tls_or_trust_behavior
+
+minimal_e2e_recipe:
+  - ensure_server_reachable_embedded_if_needed
+  - setup_robot_with_client_driver_robot_tool_optional_custom_header
+  - generate_node_groups
+  - author_valid_gn_graph_on_prc_program
+  - load_task
+  - inspect_toolpath_and_alarms
+  - simulate_slider_or_play
+  - export_program_if_needed
+  - optional_import_src_and_resimulate
+
+known_pitfalls:
+  - modifying_identity_driver_robot_tool_while_connected
+  - mixing_lin_with_ptp_or_axis_in_single_motion_group
+  - assuming_group_separation_without_order_and_motion_group_discipline
+  - relying_on_outdated_docs_that_mark_action_group_as_5_2_plus_only
+  - forgetting_blender_meter_vs_prc_millimeter_conversion
+
+definition_of_done:
+  - requested_behavior_implemented
+  - no_code_doc_drift
+  - yaml_source_of_truth_updated_when_logic_changes
+  - readme_updated_when_user_visible_behavior_changes

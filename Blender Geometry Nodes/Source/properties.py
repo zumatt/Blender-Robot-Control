@@ -201,6 +201,11 @@ class PRCSceneProps(bpy.types.PropertyGroup):
         description="Client-chosen unique identifier for this robot setup.",
         default="PRC_Blender",
     )
+    custom_header_text: bpy.props.PointerProperty(
+        name="Custom Header Text",
+        description="Optional Text datablock containing multi-line header code sent to the server.",
+        type=bpy.types.Text,
+    )
     robot_driver: bpy.props.EnumProperty(
         name="Driver",
         description="Robot driver class. Filters the Robot dropdown to the matching brand.",
@@ -231,6 +236,7 @@ class PRCSceneProps(bpy.types.PropertyGroup):
         default=0.0,
         update=_on_simulation_slider_update,
     )
+    simulation_playing: bpy.props.BoolProperty(default=False)
     setup_done: bpy.props.BoolProperty(default=False)
     task_loaded: bpy.props.BoolProperty(default=False)
     status_message: bpy.props.StringProperty(default="Idle.")

@@ -9,7 +9,7 @@ from . import properties as _props  # noqa: F401  (kept for future use)
 
 PRC_OWNER_TAG = "prc_owner"
 PRC_OWNER_VALUE = "PRC_Blender"
-PRC_VERSION = 21  # bump to force rebuild of existing PRC-owned node groups
+PRC_VERSION = 27  # bump to force rebuild of existing PRC-owned node groups
 
 # Bumped whenever the canonical starter tree layout changes. Pressing
 # "Generate Geometry Node Groups" on a carrier tree with an older starter
@@ -32,7 +32,14 @@ NG_ANIMATION_HELPER = "PRC Animation Helper"
 NG_GREASE_PENCIL_HELPER = "PRC Grease Pencil Helper"
 NG_APPROACH_RETRACT = "PRC Approach Retract"
 NG_ORIENT_TO_POINT = "PRC Orient to Point"
+NG_SET_OUTPUT = "PRC Set Output"
+NG_WAIT = "PRC Wait"
+NG_WAIT_FOR_INPUT = "PRC Wait For Input"
+NG_BRAKE = "PRC Brake"
 NG_INSERT_CODE = "PRC Insert Code"
+NG_INTERRUPT_DECL = "PRC Interrupt Declaration"
+NG_INTERRUPT_CONTROL = "PRC Interrupt Control"
+NG_FUNC_DEF = "PRC Function Definition"
 
 # Node groups whose interface exposes an internal "Seed" Int input.
 # NODE_OT_add_prc_group randomises the per-instance default and hides the
@@ -63,6 +70,13 @@ def _all_group_names() -> tuple[str, ...]:
         NG_GREASE_PENCIL_HELPER,
         NG_APPROACH_RETRACT,
         NG_ORIENT_TO_POINT,
+        NG_SET_OUTPUT,
+        NG_WAIT,
+        NG_WAIT_FOR_INPUT,
+        NG_BRAKE,
+        NG_INTERRUPT_DECL,
+        NG_INTERRUPT_CONTROL,
+        NG_FUNC_DEF,
     )
     if _supports_string_attrs():
         base = base + (NG_INSERT_CODE,)
@@ -90,6 +104,58 @@ def _is_current_version(ng: bpy.types.NodeTree) -> bool:
 def _tag(ng: bpy.types.NodeTree) -> None:
     ng[PRC_OWNER_TAG] = PRC_OWNER_VALUE
     ng["prc_version"] = PRC_VERSION
+
+
+def _has_store_named_attr(ng: bpy.types.NodeTree, attr_name: str) -> bool:
+    for n in ng.nodes:
+        if getattr(n, "bl_idname", "") != "GeometryNodeStoreNamedAttribute":
+            continue
+        try:
+            if n.inputs["Name"].default_value == attr_name:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _has_node_type(ng: bpy.types.NodeTree, bl_idname: str) -> bool:
+    for n in ng.nodes:
+        if getattr(n, "bl_idname", "") == bl_idname:
+            return True
+    return False
+
+
+def _has_linked_group_output_geometry(ng: bpy.types.NodeTree) -> bool:
+    for n in ng.nodes:
+        if getattr(n, "bl_idname", "") != "NodeGroupOutput":
+            continue
+        try:
+            sock = n.inputs.get("Geometry")
+            if sock is not None and bool(getattr(sock, "is_linked", False)):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _is_group_healthy(name: str, ng: bpy.types.NodeTree) -> bool:
+    """Best-effort structural checks for groups that had version-specific
+    build failures in older versions. Keeps generation non-destructive while
+    still auto-repairing known incomplete node groups."""
+    if name == NG_INTERRUPT_DECL:
+        required = (
+            "prc_action_kind",
+            "prc_interrupt_prio",
+            "prc_interrupt_global",
+            "prc_interrupt_port",
+            "prc_interrupt_condition",
+            "prc_interrupt_subprogram_id",
+        )
+        has_attrs = all(_has_store_named_attr(ng, attr) for attr in required)
+        has_mesh_out = _has_node_type(ng, "GeometryNodePointsToVertices")
+        has_output_link = _has_linked_group_output_geometry(ng)
+        return has_attrs and has_mesh_out and has_output_link
+    return True
 
 
 def _wipe_internals(ng: bpy.types.NodeTree) -> None:
@@ -1662,6 +1728,164 @@ def _build_orient_to_point(ng: bpy.types.NodeTree) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Action nodes
+# ---------------------------------------------------------------------------
+
+def _build_set_output(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketInt", "Port")
+    _add_socket(ng, "INPUT", "NodeSocketBool", "State")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "Port":
+            try:
+                item.default_value = 1
+            except Exception:  # noqa: BLE001
+                pass
+        elif item.name == "State":
+            try:
+                item.default_value = True
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in = _new_node(ng, "NodeGroupInput", (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (1400, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-500, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+    geo = _store_const(ng, geo, "prc_motion", "INT", 3, (-200, 0))
+    geo = _store_const(ng, geo, "prc_group_type", "INT", 2, (0, 0))
+    geo = _store_const(ng, geo, "prc_action_kind", "INT", 1, (200, 0))
+
+    port_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    port_store.data_type = "INT"
+    port_store.domain = "POINT"
+    port_store.inputs["Name"].default_value = "prc_io_port"
+    _link(ng, geo, port_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Port"], port_store.inputs["Value"])
+    geo = port_store.outputs["Geometry"]
+
+    state_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (800, 0))
+    state_store.data_type = "BOOLEAN"
+    state_store.domain = "POINT"
+    state_store.inputs["Name"].default_value = "prc_io_state"
+    _link(ng, geo, state_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["State"], state_store.inputs["Value"])
+    geo = state_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (1100, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+def _build_wait(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketFloat", "Seconds")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "Seconds":
+            try:
+                item.default_value = 1.0
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in = _new_node(ng, "NodeGroupInput", (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (1200, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-500, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+    geo = _store_const(ng, geo, "prc_motion", "INT", 3, (-200, 0))
+    geo = _store_const(ng, geo, "prc_group_type", "INT", 2, (0, 0))
+    geo = _store_const(ng, geo, "prc_action_kind", "INT", 2, (200, 0))
+
+    sec_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    sec_store.data_type = "FLOAT"
+    sec_store.domain = "POINT"
+    sec_store.inputs["Name"].default_value = "prc_wait_sec"
+    _link(ng, geo, sec_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Seconds"], sec_store.inputs["Value"])
+    geo = sec_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (900, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+def _build_wait_for_input(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketInt", "Port")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "Port":
+            try:
+                item.default_value = 1
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in = _new_node(ng, "NodeGroupInput", (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (1200, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-500, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+    geo = _store_const(ng, geo, "prc_motion", "INT", 3, (-200, 0))
+    geo = _store_const(ng, geo, "prc_group_type", "INT", 2, (0, 0))
+    geo = _store_const(ng, geo, "prc_action_kind", "INT", 3, (200, 0))
+
+    port_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    port_store.data_type = "INT"
+    port_store.domain = "POINT"
+    port_store.inputs["Name"].default_value = "prc_in_port"
+    _link(ng, geo, port_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Port"], port_store.inputs["Value"])
+    geo = port_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (900, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+def _build_brake(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketBool", "Stop 1")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "Stop 1":
+            try:
+                item.default_value = False
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in = _new_node(ng, "NodeGroupInput", (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (1200, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-500, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+    geo = _store_const(ng, geo, "prc_motion", "INT", 3, (-200, 0))
+    geo = _store_const(ng, geo, "prc_group_type", "INT", 2, (0, 0))
+    geo = _store_const(ng, geo, "prc_action_kind", "INT", 6, (200, 0))
+
+    stop_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    stop_store.data_type = "BOOLEAN"
+    stop_store.domain = "POINT"
+    stop_store.inputs["Name"].default_value = "prc_brake_stop1"
+    _link(ng, geo, stop_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Stop 1"], stop_store.inputs["Value"])
+    geo = stop_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (900, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+# ---------------------------------------------------------------------------
 # Insert Code (9) — Blender 5.2+ only. Emits a single action waypoint that
 # the reader translates into TaskPayload(action_task=Action(insert_code...)).
 # ---------------------------------------------------------------------------
@@ -1686,8 +1910,9 @@ def _build_insert_code(ng: bpy.types.NodeTree) -> None:
 
     geo = _store_const(ng, geo, "prc_motion",        "INT", 3, (-100, 0))
     geo = _store_const(ng, geo, "prc_group_type",    "INT", 2, ( 100, 0))
+    geo = _store_const(ng, geo, "prc_action_kind",   "INT", 0, ( 300, 0))
 
-    code_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    code_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (700, 0))
     code_store.data_type = "STRING"
     code_store.domain = "POINT"
     code_store.inputs["Name"].default_value = "prc_inline_code"
@@ -1695,7 +1920,7 @@ def _build_insert_code(ng: bpy.types.NodeTree) -> None:
     _link(ng, group_in.outputs["Code"], code_store.inputs["Value"])
     geo = code_store.outputs["Geometry"]
 
-    cmt_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (800, 0))
+    cmt_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (1000, 0))
     cmt_store.data_type = "BOOLEAN"
     cmt_store.domain = "POINT"
     cmt_store.inputs["Name"].default_value = "prc_is_comment"
@@ -1703,9 +1928,196 @@ def _build_insert_code(ng: bpy.types.NodeTree) -> None:
     _link(ng, group_in.outputs["Is Comment"], cmt_store.inputs["Value"])
     geo = cmt_store.outputs["Geometry"]
 
-    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (1200, 0))
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (1400, 0))
     _link(ng, geo, to_mesh.inputs[0])
     _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+# ---------------------------------------------------------------------------
+# Interrupt Declaration (10) — Blender 5.1+. Emits a single action
+# waypoint that the reader translates into an INTERRUPT DECL statement.
+# Syntax: [GLOBAL] INTERRUPT DECL Prio WHEN $IN[Port]==Condition DO Subprogram
+# ---------------------------------------------------------------------------
+
+def _build_interrupt_decl(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketInt",    "Priority")
+    _add_socket(ng, "INPUT", "NodeSocketBool",   "Is Global")
+    _add_socket(ng, "INPUT", "NodeSocketInt",    "Port")
+    _add_socket(ng, "INPUT", "NodeSocketBool",   "Condition")
+    _add_socket(ng, "INPUT", "NodeSocketInt",    "Subprogram ID")
+    _add_socket(ng, "INPUT", "NodeSocketString", "Subprogram")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    # Set reasonable defaults
+    for item in ng.interface.items_tree:
+        if item.name == "Priority":
+            try: item.default_value = 23
+            except Exception: pass
+        elif item.name == "Port":
+            try: item.default_value = 1
+            except Exception: pass
+        elif item.name == "Subprogram ID":
+            try: item.default_value = 1
+            except Exception: pass
+        elif item.name == "Subprogram":
+            try: item.default_value = "UP1"
+            except Exception: pass
+
+    group_in  = _new_node(ng, "NodeGroupInput",  (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (2000, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-400, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+
+    geo = _store_const(ng, geo, "prc_motion",        "INT", 3, (-100, 0))
+    geo = _store_const(ng, geo, "prc_group_type",    "INT", 2, ( 100, 0))
+    geo = _store_const(ng, geo, "prc_action_kind",   "INT", 4, ( 300, 0))
+
+    # Store priority
+    prio_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (600, 0))
+    prio_store.data_type = "INT"
+    prio_store.domain = "POINT"
+    prio_store.inputs["Name"].default_value = "prc_interrupt_prio"
+    _link(ng, geo, prio_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Priority"], prio_store.inputs["Value"])
+    geo = prio_store.outputs["Geometry"]
+
+    # Store is_global
+    global_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (800, 0))
+    global_store.data_type = "BOOLEAN"
+    global_store.domain = "POINT"
+    global_store.inputs["Name"].default_value = "prc_interrupt_global"
+    _link(ng, geo, global_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Is Global"], global_store.inputs["Value"])
+    geo = global_store.outputs["Geometry"]
+
+    # Store port
+    port_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (1000, 0))
+    port_store.data_type = "INT"
+    port_store.domain = "POINT"
+    port_store.inputs["Name"].default_value = "prc_interrupt_port"
+    _link(ng, geo, port_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Port"], port_store.inputs["Value"])
+    geo = port_store.outputs["Geometry"]
+
+    # Store condition
+    cond_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (1200, 0))
+    cond_store.data_type = "BOOLEAN"
+    cond_store.domain = "POINT"
+    cond_store.inputs["Name"].default_value = "prc_interrupt_condition"
+    _link(ng, geo, cond_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Condition"], cond_store.inputs["Value"])
+    geo = cond_store.outputs["Geometry"]
+
+    # Store subprogram numeric fallback (works on Blender 5.1)
+    subprog_id_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (1400, 0))
+    subprog_id_store.data_type = "INT"
+    subprog_id_store.domain = "POINT"
+    subprog_id_store.inputs["Name"].default_value = "prc_interrupt_subprogram_id"
+    _link(ng, geo, subprog_id_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Subprogram ID"], subprog_id_store.inputs["Value"])
+    geo = subprog_id_store.outputs["Geometry"]
+
+    # Store subprogram name only on Blender versions that support
+    # STRING Store Named Attribute values (5.2+).
+    if _supports_string_attrs():
+        subprog_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (1600, 0))
+        subprog_store.data_type = "STRING"
+        subprog_store.domain = "POINT"
+        subprog_store.inputs["Name"].default_value = "prc_interrupt_subprogram"
+        _link(ng, geo, subprog_store.inputs["Geometry"])
+        _link(ng, group_in.outputs["Subprogram"], subprog_store.inputs["Value"])
+        geo = subprog_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (1800, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+# ---------------------------------------------------------------------------
+# Interrupt Control (11) — Blender 5.1+. Emits one action waypoint that the
+# reader translates into "INTERRUPT ON <Number>" or "INTERRUPT OFF <Number>".
+# ---------------------------------------------------------------------------
+
+def _build_interrupt_control(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT", "NodeSocketInt", "Number")
+    _add_socket(ng, "INPUT", "NodeSocketBool", "Enable")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "Number":
+            try:
+                item.default_value = 1
+            except Exception:  # noqa: BLE001
+                pass
+        elif item.name == "Enable":
+            try:
+                item.default_value = True
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in = _new_node(ng, "NodeGroupInput", (-800, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", (1400, 0))
+
+    points = _new_node(ng, "GeometryNodePoints", (-500, 0))
+    points.inputs["Count"].default_value = 1
+
+    geo = points.outputs["Points"]
+    geo = _store_const(ng, geo, "prc_motion", "INT", 3, (-200, 0))
+    geo = _store_const(ng, geo, "prc_group_type", "INT", 2, (0, 0))
+    geo = _store_const(ng, geo, "prc_action_kind", "INT", 5, (200, 0))
+
+    num_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (500, 0))
+    num_store.data_type = "INT"
+    num_store.domain = "POINT"
+    num_store.inputs["Name"].default_value = "prc_interrupt_number"
+    _link(ng, geo, num_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Number"], num_store.inputs["Value"])
+    geo = num_store.outputs["Geometry"]
+
+    en_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (800, 0))
+    en_store.data_type = "BOOLEAN"
+    en_store.domain = "POINT"
+    en_store.inputs["Name"].default_value = "prc_interrupt_enable"
+    _link(ng, geo, en_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["Enable"], en_store.inputs["Value"])
+    geo = en_store.outputs["Geometry"]
+
+    to_mesh = _new_node(ng, "GeometryNodePointsToVertices", (1100, 0))
+    _link(ng, geo, to_mesh.inputs[0])
+    _link(ng, to_mesh.outputs["Mesh"], group_out.inputs["Geometry"])
+
+
+# ---------------------------------------------------------------------------
+# Function Definition — tags connected geometry as a named subprogram body.
+# Every point receives prc_function_subprogram_id = ID so the export step
+# can emit: DEF UP{ID} () / <actions> / END after the main program's END.
+# ---------------------------------------------------------------------------
+
+def _build_func_def(ng: bpy.types.NodeTree) -> None:
+    _add_socket(ng, "INPUT",  "NodeSocketGeometry", "Geometry")
+    _add_socket(ng, "INPUT",  "NodeSocketInt",      "ID")
+    _add_socket(ng, "OUTPUT", "NodeSocketGeometry", "Geometry")
+
+    for item in ng.interface.items_tree:
+        if item.name == "ID":
+            try:
+                item.default_value = 1
+            except Exception:  # noqa: BLE001
+                pass
+
+    group_in  = _new_node(ng, "NodeGroupInput",  (-400, 0))
+    group_out = _new_node(ng, "NodeGroupOutput", ( 400, 0))
+
+    id_store = _new_node(ng, "GeometryNodeStoreNamedAttribute", (0, 0))
+    id_store.data_type = "INT"
+    id_store.domain = "POINT"
+    id_store.inputs["Name"].default_value = "prc_function_subprogram_id"
+    _link(ng, group_in.outputs["Geometry"], id_store.inputs["Geometry"])
+    _link(ng, group_in.outputs["ID"],       id_store.inputs["Value"])
+    _link(ng, id_store.outputs["Geometry"], group_out.inputs["Geometry"])
 
 
 # ---------------------------------------------------------------------------
@@ -1798,34 +2210,54 @@ BUILDERS = {
     NG_GREASE_PENCIL_HELPER: _build_grease_pencil_helper,
     NG_APPROACH_RETRACT: _build_approach_retract,
     NG_ORIENT_TO_POINT: _build_orient_to_point,
+    NG_SET_OUTPUT: _build_set_output,
+    NG_WAIT: _build_wait,
+    NG_WAIT_FOR_INPUT: _build_wait_for_input,
+    NG_BRAKE: _build_brake,
     NG_INSERT_CODE: _build_insert_code,
+    NG_INTERRUPT_DECL: _build_interrupt_decl,
+    NG_INTERRUPT_CONTROL: _build_interrupt_control,
+    NG_FUNC_DEF: _build_func_def,
 }
 
 
-def ensure_node_groups() -> tuple[int, int, int]:
-    """Create missing node groups, upgrade PRC-owned groups whose version is
-    behind the current PRC_VERSION, and leave other groups as is. Existing
-    PRC-owned groups are wiped and rebuilt **in place** so that any user
-    references to them (e.g. inside the carrier tree) stay valid.
+def ensure_node_groups(*, upgrade_existing: bool = False) -> tuple[int, int, int]:
+    """Create missing node groups and keep existing groups as is by default.
+
+    When ``upgrade_existing`` is True, PRC-owned groups behind PRC_VERSION are
+    wiped and rebuilt **in place**. This may affect existing links in user node
+    trees, so the default behaviour is intentionally non-destructive.
     Returns (created, upgraded, kept)."""
     created = upgraded = kept = 0
     for name in ALL_GROUP_NAMES:
         existing = bpy.data.node_groups.get(name)
         if existing is not None and _is_ours(existing):
-            if _is_current_version(existing):
+            needs_upgrade = upgrade_existing and not _is_current_version(existing)
+            needs_repair = not _is_group_healthy(name, existing)
+            if not (needs_upgrade or needs_repair):
                 kept += 1
                 continue
             _wipe_internals(existing)
-            _tag(existing)
             BUILDERS[name](existing)
+            _tag(existing)
             upgraded += 1
             continue
+        if existing is not None and not _is_ours(existing):
+            # Legacy/foreign tree using a canonical PRC group name: reclaim
+            # the exact name in-place so old node instances keep pointing to
+            # the rebuilt definition instead of drifting to a *_PRC shadow.
+            if existing.bl_idname == "GeometryNodeTree" and name.startswith("PRC "):
+                _wipe_internals(existing)
+                BUILDERS[name](existing)
+                _tag(existing)
+                upgraded += 1
+                continue
         if existing is not None and not _is_ours(existing):
             ng = bpy.data.node_groups.new(name + "_PRC", "GeometryNodeTree")
         else:
             ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
-        _tag(ng)
         BUILDERS[name](ng)
+        _tag(ng)
         created += 1
     return created, upgraded, kept
 
@@ -1865,18 +2297,25 @@ def _menu_sections() -> tuple[tuple[str, tuple[str, ...]], ...]:
         NG_GREASE_PENCIL_HELPER,
     )
     modifiers = (NG_APPROACH_RETRACT, NG_ORIENT_TO_POINT)
-    actions = (NG_INSERT_CODE,) if _supports_string_attrs() else ()
-    groups = (NG_PTP_GROUP, NG_CP_GROUP)
-    if actions:
-        groups = groups + (NG_ACTION_GROUP,)
+    actions = (
+        NG_SET_OUTPUT,
+        NG_WAIT,
+        NG_WAIT_FOR_INPUT,
+        NG_BRAKE,
+        NG_INTERRUPT_DECL,
+        NG_INTERRUPT_CONTROL,
+        NG_FUNC_DEF,
+    )
+    if _supports_string_attrs():
+        actions = actions + (NG_INSERT_CODE,)
+    groups = (NG_PTP_GROUP, NG_CP_GROUP, NG_ACTION_GROUP)
     sections = [
         ("Motion Commands", (NG_AXIS, NG_PTP, NG_LIN)),
         ("Motion Groups",   groups),
         ("Helpers",         helpers),
         ("Modifiers",       modifiers),
     ]
-    if actions:
-        sections.append(("Actions", actions))
+    sections.append(("Actions", actions))
     sections.append(("Task", (NG_TASK,)))
     return tuple(sections)
 

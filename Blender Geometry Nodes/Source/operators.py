@@ -2,14 +2,67 @@
 
 from __future__ import annotations
 
+import os
+import time
 import webbrowser
 
 import bpy
 import mathutils
 
+from . import embedded_backend as _backend
 from . import grpc_client as _client
 from . import node_groups as _ng
 from . import reader as _reader
+from . import src_importer as _src_importer
+
+
+_sim_play_timer_armed: bool = False
+_sim_play_last_ts: float = 0.0
+
+
+def _stop_simulation_play(scene=None) -> None:
+    """Stop looped simulation playback and clear UI state."""
+    global _sim_play_timer_armed
+    _sim_play_timer_armed = False
+    if scene is not None and hasattr(scene, "prc"):
+        scene.prc.simulation_playing = False
+
+
+def _simulation_play_tick():
+    """Advance the simulation slider in a loop while playback is enabled.
+
+    Returning None unregisters the timer; returning a float schedules the
+    next tick in that many seconds.
+    """
+    global _sim_play_last_ts
+
+    scene = bpy.context.scene
+    if scene is None or not hasattr(scene, "prc"):
+        _stop_simulation_play(scene)
+        return None
+
+    props = scene.prc
+    if not props.simulation_playing:
+        _stop_simulation_play(scene)
+        return None
+
+    if not _client.is_setup_done() or not props.task_loaded:
+        _stop_simulation_play(scene)
+        return None
+
+    now = time.monotonic()
+    dt = max(0.0, min(0.2, now - _sim_play_last_ts))
+    _sim_play_last_ts = now
+
+    duration_s = float(_client.last_task_duration_seconds() or 0.0)
+    if duration_s <= 0.0:
+        # Fallback when the server did not report duration.
+        delta = 1.0 / 300.0
+    else:
+        delta = dt / duration_s
+
+    props.simulation_slider = (float(props.simulation_slider) + delta) % 1.0
+    return 1.0 / 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +111,16 @@ class PRC_OT_setup_robot(bpy.types.Operator):
         col.prop(self, "replace_geometry")
 
     def execute(self, context):
-        if _client.is_setup_done():
-            self.report({"INFO"}, "Already set up.")
+        if _client.is_setup_done() or _client.is_connected():
+            # SetupRobot is intended to be repeatable (e.g. after changing
+            # robot model, driver, tool dictionary, or base). Tear down the
+            # current session first so a fresh setup can start immediately.
+            _client.disconnect()
+
+        ok, msg = _backend.ensure_started()
+        context.scene.prc.status_message = msg
+        if not ok:
+            self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
         scene = context.scene
@@ -78,6 +139,14 @@ class PRC_OT_setup_robot(bpy.types.Operator):
             saved_settings = {}
 
         tool = scene.prc_tool
+        header_text_obj = getattr(scene.prc, "custom_header_text", None)
+        if header_text_obj is not None:
+            try:
+                custom_header_value = header_text_obj.as_string()
+            except Exception:  # noqa: BLE001
+                custom_header_value = ""
+        else:
+            custom_header_value = ""
         tool_snapshot = {
             "tool_id":  int(tool.tool_id),
             "tool_x":   float(tool.tool_x),
@@ -94,6 +163,7 @@ class PRC_OT_setup_robot(bpy.types.Operator):
 
         snapshot = {
             "client_id": scene.prc.client_id,
+            "custom_header": custom_header_value,
             "robot_type": scene.prc.robot_type,
             "robot_driver": scene.prc.robot_driver,
             "replace_geometry": bool(self.replace_geometry),
@@ -136,8 +206,43 @@ class PRC_OT_open_settings(bpy.types.Operator):
     bl_label = "Open Settings"
 
     def execute(self, context):
+        ok, msg = _backend.ensure_started()
+        context.scene.prc.status_message = msg
+        if not ok:
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
         webbrowser.open_new("https://127.0.0.1:5001")
         return {"FINISHED"}
+
+
+class PRC_OT_toggle_embedded_server(bpy.types.Operator):
+    """Start or stop the bundled PRC server process."""
+
+    bl_idname = "prc.toggle_embedded_server"
+    bl_label = "Toggle Embedded Server"
+
+    def execute(self, context):
+        if _backend.is_running():
+            _backend.stop()
+            msg = "Embedded PRC server stopped."
+            context.scene.prc.status_message = msg
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+
+        if _backend.endpoint_reachable():
+            msg = "PRC server already running on 127.0.0.1:5001 (external process)."
+            context.scene.prc.status_message = msg
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+
+        ok, msg = _backend.ensure_started()
+        context.scene.prc.status_message = msg
+        if ok:
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+
+        self.report({"ERROR"}, msg)
+        return {"CANCELLED"}
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +261,7 @@ class PRC_OT_load_task(bpy.types.Operator):
         return _client.is_setup_done()
 
     def execute(self, context):
+        _stop_simulation_play(context.scene)
         scene = context.scene
         try:
             task = _reader.build_task_from_carrier(scene)
@@ -176,6 +282,72 @@ class PRC_OT_load_task(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PRC_OT_export_program(bpy.types.Operator):
+    """Export the most recently generated robot program code to a file."""
+
+    bl_idname = "prc.export_program"
+    bl_label = "Export Robot Program"
+    bl_options = {"REGISTER"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filename_ext = ".txt"
+
+    @classmethod
+    def poll(cls, context):
+        return _client.is_setup_done() and context.scene.prc.task_loaded and _client.has_program_code()
+
+    def _default_ext(self, context) -> str:
+        driver = getattr(context.scene.prc, "robot_driver", "")
+        if driver.startswith("KUKA."):
+            return ".src"
+        if driver.startswith("ABB."):
+            return ".mod"
+        if driver.startswith("UR."):
+            return ".script"
+        return ".txt"
+
+    def invoke(self, context, event):
+        ext = self._default_ext(context)
+        self.filename_ext = ext
+        task_name = (context.scene.prc.task_name or "Task").strip() or "Task"
+        self.filepath = bpy.path.ensure_ext(task_name, ext)
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        code = _client.last_program_code()
+        if not code.strip():
+            self.report({"ERROR"}, "No generated program code to export. Load Task first.")
+            return {"CANCELLED"}
+
+        # Collect DEF UPx() subprogram blocks from PRC Function Definition nodes
+        # and append them after the main program's closing END.
+        try:
+            func_defs = _reader.collect_function_definitions_from_carrier(context.scene)
+            if func_defs:
+                suffix = ""
+                for sid in sorted(func_defs.keys()):
+                    lines = func_defs[sid]
+                    suffix += f"\n\nDEF UP{sid} ()\n"
+                    suffix += "\n".join(lines)
+                    suffix += "\nEND"
+                code = code.rstrip() + suffix + "\n"
+        except Exception as e:  # noqa: BLE001
+            self.report({"WARNING"}, f"Could not collect function definitions: {e}")
+
+        filepath = bpy.path.ensure_ext(self.filepath, self.filename_ext)
+        try:
+            os.makedirs(os.path.dirname(bpy.path.abspath(filepath)), exist_ok=True)
+            with open(bpy.path.abspath(filepath), "w", encoding="utf-8", newline="\n") as f:
+                f.write(code)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, f"Export failed: {e}")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Program exported to '{filepath}'.")
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------------------
 # Disconnect
 # ---------------------------------------------------------------------------
@@ -187,7 +359,60 @@ class PRC_OT_disconnect(bpy.types.Operator):
     bl_label = "Disconnect"
 
     def execute(self, context):
+        _stop_simulation_play(context.scene)
         _client.disconnect()
+        return {"FINISHED"}
+
+
+class PRC_OT_toggle_simulation_play(bpy.types.Operator):
+    """Play/stop looped simulation updates through the PRC server."""
+
+    bl_idname = "prc.toggle_simulation_play"
+    bl_label = "Play/Stop Simulation"
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return _client.is_setup_done() and scene is not None and getattr(scene.prc, "task_loaded", False)
+
+    def execute(self, context):
+        global _sim_play_timer_armed, _sim_play_last_ts
+
+        scene = context.scene
+        props = scene.prc
+
+        if props.simulation_playing:
+            _stop_simulation_play(scene)
+            props.status_message = "Simulation playback stopped."
+            self.report({"INFO"}, "Simulation playback stopped.")
+            return {"FINISHED"}
+
+        props.simulation_playing = True
+        _sim_play_last_ts = time.monotonic()
+
+        if not _sim_play_timer_armed:
+            _sim_play_timer_armed = True
+            bpy.app.timers.register(_simulation_play_tick, first_interval=0.0)
+
+        props.status_message = "Simulation playback started (loop)."
+        self.report({"INFO"}, "Simulation playback started (loop).")
+        return {"FINISHED"}
+
+
+class PRC_OT_copy_status(bpy.types.Operator):
+    """Copy the current status message to the system clipboard."""
+
+    bl_idname = "prc.copy_status"
+    bl_label = "Copy Status"
+
+    def execute(self, context):
+        msg = ""
+        try:
+            msg = str(context.scene.prc.status_message or "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        context.window_manager.clipboard = msg
+        self.report({"INFO"}, "Status copied to clipboard.")
         return {"FINISHED"}
 
 
@@ -780,15 +1005,71 @@ class PRC_OT_build_studio(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Import .src Program
+# ---------------------------------------------------------------------------
+
+class PRC_OT_import_src(bpy.types.Operator):
+    """Import a KUKA .src program file and load as task."""
+
+    bl_idname = "prc.import_src"
+    bl_label = "Import .src Program"
+    bl_options = {"REGISTER"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filename_ext = ".src"
+    filter_glob: bpy.props.StringProperty(default="*.src", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return _client.is_setup_done()
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        _stop_simulation_play(context.scene)
+        ok, msg = _src_importer.import_src_file(self.filepath, context.scene)
+        context.scene.prc.status_message = msg
+        if not ok:
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        # Automatically load the task after import
+        try:
+            task = _reader.build_task_from_carrier(context.scene)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, f"Failed to build task: {e}")
+            context.scene.prc.status_message = f"Reader: {e}"
+            return {"CANCELLED"}
+
+        is_valid, info = _client.add_task(task)
+        context.scene.prc.status_message = f"{msg} | Task: {info}"
+        if not is_valid:
+            self.report({"WARNING"}, f"Task accepted but flagged invalid. {info}")
+        else:
+            self.report({"INFO"}, f"{msg}\nTask: {info}")
+
+        # Refresh the viewport at the current slider position
+        _client.update_simulation(context.scene.prc.simulation_slider)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 classes = (
     PRC_OT_setup_robot,
     PRC_OT_generate_node_groups,
+    PRC_OT_toggle_embedded_server,
     PRC_OT_open_settings,
+    PRC_OT_toggle_simulation_play,
     PRC_OT_load_task,
+    PRC_OT_export_program,
+    PRC_OT_import_src,
     PRC_OT_disconnect,
+    PRC_OT_copy_status,
     PRC_OT_bake_animation_path,
     PRC_OT_bake_grease_pencil_path,
     PRC_OT_bake_robot_animation,

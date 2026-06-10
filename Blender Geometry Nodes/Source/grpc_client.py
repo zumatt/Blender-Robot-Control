@@ -6,6 +6,8 @@ import json
 import math
 import os
 import queue
+import subprocess
+import sys
 import threading
 from typing import Optional
 
@@ -55,10 +57,49 @@ _tick_pending: bool = False
 # 0.0 means "no task loaded yet" (also the case if the loaded task has no
 # motion). Used by the Robot Animation bake operator to derive a frame count.
 _last_task_duration_s: float = 0.0
+_last_program_code: str = ""
 
 
 def last_task_duration_seconds() -> float:
     return _last_task_duration_s
+
+
+def last_program_code() -> str:
+    return _last_program_code
+
+
+def has_program_code() -> bool:
+    return bool(_last_program_code.strip())
+
+
+def _current_custom_header() -> str:
+    """Return the configured custom header text from settings (if any)."""
+    for key in ("custom_header", "header"):
+        value = str(_settings.get(key, "") or "")
+        if value.strip():
+            return value
+    return ""
+
+
+def _header_at_top_only(code: str, header: str) -> str:
+    """Ensure custom header appears once at file start, never in body."""
+    if not code:
+        return code
+
+    header_norm = str(header or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not header_norm:
+        return code
+
+    code_norm = str(code).replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove all literal duplicates emitted by server templates (including
+    # those injected into INI-like sections), then prepend once at the top.
+    body = code_norm.replace(header_norm, "")
+    body = body.strip("\n")
+
+    if body:
+        return f"{header_norm}\n\n{body}\n"
+    return f"{header_norm}\n"
 
 
 def get_simulated_state_matrices(normalized: float) -> Optional[list[mathutils.Matrix]]:
@@ -244,10 +285,42 @@ def _addon_dir() -> str:
     return os.path.dirname(os.path.realpath(__file__))
 
 
-def _open_channel():
-    cert_path = os.path.join(_addon_dir(), "PRCServerCertificate.pem")
-    with open(cert_path, "rb") as f:
-        credentials = grpc.ssl_channel_credentials(f.read())
+def _format_rpc_error(e: grpc.RpcError) -> str:
+    """Compact gRPC error formatting for UI/status-bar diagnostics."""
+    code = "UNKNOWN"
+    details = ""
+    try:
+        c = e.code()
+        code = getattr(c, "name", str(c))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        details = e.details() or ""
+    except Exception:  # noqa: BLE001
+        details = ""
+    msg = f"{code}"
+    if details:
+        msg += f": {details}"
+    try:
+        dbg = e.debug_error_string() or ""
+    except Exception:  # noqa: BLE001
+        dbg = ""
+    if dbg:
+        dbg = " ".join(dbg.split())
+        if len(dbg) > 260:
+            dbg = dbg[:257] + "..."
+        msg += f" | debug={dbg}"
+    return msg
+
+
+def _open_channel(
+    host: str,
+    port: int,
+    use_tls: bool,
+    tls_server_name: str = "",
+    root_certificates: Optional[bytes] = None,
+):
+    target = f"{host}:{int(port)}"
     options = [
         ("grpc.max_send_message_length", -1),
         ("grpc.max_receive_message_length", -1),
@@ -259,7 +332,53 @@ def _open_channel():
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.max_pings_without_data", 0),
     ]
-    return grpc.secure_channel("127.0.0.1:5001", credentials, options)
+    if use_tls:
+        credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+        if tls_server_name:
+            options.append(("grpc.ssl_target_name_override", tls_server_name))
+            options.append(("grpc.default_authority", tls_server_name))
+        return grpc.secure_channel(target, credentials, options)
+    return grpc.insecure_channel(target, options)
+
+
+def _load_pem_file(path: str) -> Optional[bytes]:
+    """Read PEM file bytes, returning None on any failure."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_prc_ca_from_login_keychain() -> Optional[bytes]:
+    """On macOS, read the PRC issuer CA directly from the user's login keychain."""
+    if sys.platform != "darwin":
+        return None
+    keychain_path = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    cmd = [
+        "security",
+        "find-certificate",
+        "-c",
+        "Parametric Robot Control CA",
+        "-a",
+        "-p",
+        keychain_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=3,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout or b""
+    if b"BEGIN CERTIFICATE" not in out:
+        return None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -288,14 +407,56 @@ def _setup_pipeline(props: dict) -> None:
     global _feedback_thread
 
     try:
-        post_status("Opening secure channel to 127.0.0.1:5001 ...")
-        _channel = _open_channel()
-        _stub = prc_pb2_grpc.ParametricRobotControlServiceStub(_channel)
+        host = "127.0.0.1"
+        port = 5001
+        use_tls = True
+        tls_server_name = ""
 
-        post_status("Pinging server ...")
-        _stub.SendPing(prc_pb2.Ping(payload="hello", time_ms=0))
+        post_status(f"Opening secure channel to {host}:{port} ...")
+
+        trust_candidates: list[tuple[str, Optional[bytes]]] = []
+
+        keychain_ca = _load_prc_ca_from_login_keychain()
+        if keychain_ca is not None:
+            trust_candidates.append(("login keychain PRC CA", keychain_ca))
+
+        bundled_path = os.path.join(_addon_dir(), "PRCServerCertificate.pem")
+        bundled_cert = _load_pem_file(bundled_path)
+        if bundled_cert is not None:
+            trust_candidates.append(("bundled cert", bundled_cert))
+
+        # Final fallback: platform trust store.
+        trust_candidates.append(("system trust", None))
+
+        last_rpc_error: Optional[grpc.RpcError] = None
+        connected = False
+        for label, roots in trust_candidates:
+            try:
+                _channel = _open_channel(host, port, use_tls, tls_server_name, roots)
+                _stub = prc_pb2_grpc.ParametricRobotControlServiceStub(_channel)
+                post_status(f"Pinging server ({label}) ...")
+                _stub.SendPing(prc_pb2.Ping(payload="hello", time_ms=0))
+                if label == "login keychain PRC CA":
+                    post_status("TLS connected using login keychain PRC CA.")
+                connected = True
+                break
+            except grpc.RpcError as e:
+                last_rpc_error = e
+                try:
+                    if _channel is not None:
+                        _channel.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _channel = None
+                _stub = None
+
+        if not connected:
+            if last_rpc_error is not None:
+                raise last_rpc_error
+            raise RuntimeError("TLS connection failed with all trust sources.")
 
         client_id = props["client_id"]
+        custom_header = str(props.get("custom_header", "") or "")
         # robot_type is already the full preset class string (e.g.
         # "KUKA.KUKA_KR610R11002"); robot_driver is the driver class string
         # (e.g. "KUKA.KSS_KRL_Driver"). Both come from the EnumProperty.
@@ -324,6 +485,11 @@ def _setup_pipeline(props: dict) -> None:
         if user_tool is not None:
             tools[user_tool.tool_id] = user_tool
 
+        robot_metadata: dict[str, str] = {}
+        if custom_header.strip():
+            robot_metadata["header"] = custom_header
+            robot_metadata["custom_header"] = custom_header
+
         robot = prc_pb2.Robot(
             preset_robot_class=preset_class,
             robot_driver_class=driver_class,
@@ -335,7 +501,7 @@ def _setup_pipeline(props: dict) -> None:
             tool_dictionary=tools,
             # Server's GetRobotData converter NREs when MetaData is null,
             # so always populate it.
-            data=prc_pb2.MetaData(id=client_id),
+            data=prc_pb2.MetaData(id=client_id, data=robot_metadata),
         )
 
         post_status(f"Setting up robot ({preset_class}) ...")
@@ -357,6 +523,12 @@ def _setup_pipeline(props: dict) -> None:
             )
         else:
             _settings = server_settings
+
+        # Make custom header available in the settings payload sent with
+        # AddRobotTask (many server pipelines consume header text there).
+        if custom_header.strip():
+            _settings["header"] = custom_header
+            _settings["custom_header"] = custom_header
         _persist_settings_to_scene(_settings)
 
         replace_geometry = bool(props.get("replace_geometry", True))
@@ -399,6 +571,31 @@ def _setup_pipeline(props: dict) -> None:
         post_status(f"Ready. Robot ID: {_robot_id}")
         _set_setup_done(True)
 
+    except grpc.RpcError as e:
+        code_name = ""
+        try:
+            code_name = getattr(e.code(), "name", str(e.code()))
+        except Exception:  # noqa: BLE001
+            code_name = ""
+        hint = ""
+        if code_name == "UNAVAILABLE":
+            hint = (
+                " Check host/port/TLS settings and ensure HTTP/2 over TLS "
+                "(ALPN=h2) is negotiated on the gRPC endpoint."
+            )
+            try:
+                d = (e.details() or "").lower()
+            except Exception:  # noqa: BLE001
+                d = ""
+            if "certificate_verify_failed" in d or "local issuer certificate" in d:
+                hint += (
+                    " The server uses a private CA. Ensure 'Parametric Robot "
+                    "Control CA' is present in your login keychain."
+                )
+        elif code_name == "UNIMPLEMENTED":
+            hint = " Server endpoint/method mismatch: verify PRC server version and gRPC API."
+        post_status(f"Setup failed (RPC): {_format_rpc_error(e)}.{hint}")
+        _disconnect_internal()
     except Exception as e:  # noqa: BLE001
         post_status(f"Setup failed: {e!r}")
         _disconnect_internal()
@@ -1398,8 +1595,12 @@ def add_task(task: prc_pb2.Task) -> tuple[bool, str]:
         )
         reply = _stub.AddRobotTask(request)
         result = reply.simulation_result_data
-        global _last_task_duration_s
+        global _last_task_duration_s, _last_program_code
         _last_task_duration_s = float(result.time or 0.0)
+        _last_program_code = _header_at_top_only(
+            str(result.code or ""),
+            _current_custom_header(),
+        )
         _set_task_loaded(True)
         # Snapshot the toolpath vertices + alarms on the gRPC thread, with
         # in-line decimation to keep the build fast on long programs. Always
@@ -1407,7 +1608,7 @@ def add_task(task: prc_pb2.Task) -> tuple[bool, str]:
         # kept one OR has a different alarm state.
         verts, alarms = _decimate_simulation_results(result.simulation_results)
         _build_toolpath_request_main_thread(verts, alarms)
-        snippet = (result.code or "").strip().splitlines()
+        snippet = _last_program_code.strip().splitlines()
         first_line = snippet[0] if snippet else "(no code)"
         info = f"valid={result.is_valid}, t={result.time:.2f}s, code: {first_line[:60]}"
         return result.is_valid, info
@@ -1446,6 +1647,7 @@ def disconnect() -> None:
 
 def _disconnect_internal() -> None:
     global _channel, _stub, _settings, _robot_id, _link_count, _link_offset
+    global _last_program_code
     global _worker_thread, _feedback_thread, _stop_event
 
     if _stop_event is not None:
@@ -1466,6 +1668,7 @@ def _disconnect_internal() -> None:
     _robot_id = ""
     _link_count = 0
     _link_offset = 1
+    _last_program_code = ""
     _worker_thread = None
     _feedback_thread = None
     _stop_event = None
